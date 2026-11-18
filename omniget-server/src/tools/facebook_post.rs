@@ -140,7 +140,7 @@ static FB_DASH_DIRECT_AUDIO_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 
 static SCONTENT_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https://scontent[^"'\s<>;)]+\.(?:jpg|png|webp)[^"'\s<>;)]*"#)
+    Regex::new(r#"https://scontent[^"'\s<>()]+\.(?:jpg|png|webp)[^"'\s<>()]*"#)
         .expect("Valid scontent image extraction regex")
 });
 
@@ -1493,7 +1493,7 @@ async fn expand_remaining_album_photos(
         {
             Some(id) => id,
             None => {
-                tracing::debug!("[facebook] No nextMediaAfterNodeId on {} (final: {})", photo_url, final_url);
+                tracing::info!("[facebook] No nextMediaAfterNodeId on {} (final: {}, len: {})", photo_url, final_url, page_html.len());
                 break;
             }
         };
@@ -1938,7 +1938,8 @@ pub fn extract_attached_images_from_html(html: &str, primary_image: Option<&str>
     }
 
     for mat in SCONTENT_IMAGE_RE.find_iter(html) {
-        let cleaned = clean_facebook_cdn_url(mat.as_str());
+        let raw_match = mat.as_str().split(";background").next().unwrap_or(mat.as_str());
+        let cleaned = clean_facebook_cdn_url(raw_match);
 
         // Filter out small thumbnails, profile badges, and emojis
         let lower = cleaned.to_lowercase();
