@@ -140,7 +140,7 @@ static FB_DASH_DIRECT_AUDIO_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 
 static SCONTENT_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https://scontent[^"'\s<>]+\.(?:jpg|png|webp)[^"'\s<>]*"#)
+    Regex::new(r#"https://scontent[^"'\s<>;)]+\.(?:jpg|png|webp)[^"'\s<>;)]*"#)
         .expect("Valid scontent image extraction regex")
 });
 
@@ -179,7 +179,7 @@ static PCB_SET_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static NEXT_MEDIA_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""nextMediaAfterNodeId"\s*:\s*\{\s*"__typename"\s*:\s*"Photo"\s*,\s*"id"\s*:\s*"(\d+)""#)
+    Regex::new(r#""nextMediaAfterNodeId"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)""#)
         .expect("Valid nextMediaAfterNodeId regex")
 });
 
@@ -1459,19 +1459,28 @@ async fn expand_remaining_album_photos(
     let max_hops = target_total.saturating_sub(album_photos.len()).min(15);
     for _ in 0..max_hops {
         let photo_url = format!(
-            "https://www.facebook.com/photo.php?fbid={}&set={}&type=3",
+            "https://www.facebook.com/photo/?fbid={}&set={}",
             cur_id, set_id
         );
         let res = match client
             .get(&photo_url)
             .header("User-Agent", FB_CRAWLER_USER_AGENT)
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
             .send()
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            _ => break,
+            Ok(r) => {
+                tracing::debug!("[facebook] Album photo page {} returned HTTP {}", photo_url, r.status());
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("[facebook] Album photo page {} failed: {}", photo_url, e);
+                break;
+            }
         };
+        let final_url = res.url().as_str().to_string();
         let page_html = match res.text().await {
             Ok(t) => t,
             Err(_) => break,
@@ -1483,7 +1492,10 @@ async fn expand_remaining_album_photos(
             .map(|m| m.as_str().to_string())
         {
             Some(id) => id,
-            None => break,
+            None => {
+                tracing::debug!("[facebook] No nextMediaAfterNodeId on {} (final: {})", photo_url, final_url);
+                break;
+            }
         };
 
         if !seen_ids.insert(next_id.clone()) {
@@ -1936,6 +1948,13 @@ pub fn extract_attached_images_from_html(html: &str, primary_image: Option<&str>
             || lower.contains("/s50x50/")
             || lower.contains("/p100x100/")
             || lower.contains("/s100x100/")
+            || lower.contains("s32x32")
+            || lower.contains("s40x40")
+            || lower.contains("s60x60")
+            || lower.contains("p32x32")
+            || lower.contains("p40x40")
+            || lower.contains("p60x60")
+            || lower.contains("mx120x120")
         {
             continue;
         }
