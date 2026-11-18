@@ -173,6 +173,16 @@ static SCRIPT_JSON_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Valid script application/json regex")
 });
 
+static PCB_SET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(pcb\.\d+)"#)
+        .expect("Valid pcb set regex")
+});
+
+static NEXT_MEDIA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""nextMediaAfterNodeId"\s*:\s*\{\s*"__typename"\s*:\s*"Photo"\s*,\s*"id"\s*:\s*"(\d+)""#)
+        .expect("Valid nextMediaAfterNodeId regex")
+});
+
 // ── Data Models ──────────────────────────────────────────────────────────────
 
 /// Arguments payload for `facebook_post` tool invocations.
@@ -1048,6 +1058,14 @@ struct RelayExtractionResult {
     author_ids: Vec<String>,
     author_names: Vec<String>,
     comments: Vec<RawRelayComment>,
+    album_photos: Vec<RelayAlbumPhoto>,
+    expected_album_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RelayAlbumPhoto {
+    id: Option<String>,
+    url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1063,6 +1081,57 @@ fn push_unique_str(vec: &mut Vec<String>, val: &str) {
     let trimmed = val.trim();
     if !trimmed.is_empty() && !vec.iter().any(|x| x == trimmed) {
         vec.push(trimmed.to_string());
+    }
+}
+
+fn push_unique_album_photo(out: &mut RelayExtractionResult, id: Option<String>, raw_uri: Option<&str>) {
+    let resolved_url = raw_uri
+        .map(clean_facebook_cdn_url)
+        .filter(|u| u.starts_with("http"))
+        .or_else(|| {
+            id.as_ref()
+                .map(|pid| format!("https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id={}", pid))
+        });
+
+    let Some(url) = resolved_url else {
+        return;
+    };
+
+    let dup_by_id = id
+        .as_ref()
+        .map(|pid| out.album_photos.iter().any(|p| p.id.as_deref() == Some(pid.as_str())))
+        .unwrap_or(false);
+    let dup_by_url = out.album_photos.iter().any(|p| p.url == url);
+
+    if !dup_by_id && !dup_by_url {
+        out.album_photos.push(RelayAlbumPhoto { id, url });
+    }
+}
+
+fn extract_photo_from_media_obj(media: &Value) -> Option<(Option<String>, Option<String>)> {
+    let typename = media.get("__typename").and_then(Value::as_str).unwrap_or("");
+    let is_playable = media.get("is_playable").and_then(Value::as_bool);
+    if typename != "Photo" && is_playable != Some(false) {
+        return None;
+    }
+
+    let photo_id = media
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let uri = media
+        .pointer("/viewer_image/uri")
+        .or_else(|| media.pointer("/image/uri"))
+        .or_else(|| media.pointer("/photo_image/uri"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    if photo_id.is_some() || uri.is_some() {
+        Some((photo_id, uri))
+    } else {
+        None
     }
 }
 
@@ -1087,7 +1156,7 @@ fn extract_comment_attachment_urls(attachments: &[Value]) -> Vec<String> {
     urls
 }
 
-fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize) {
+fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize, in_comment: bool) {
     if depth > 60 {
         return;
     }
@@ -1095,40 +1164,68 @@ fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize) {
     match val {
         Value::Array(arr) => {
             for item in arr {
-                walk_relay_json(item, out, depth + 1);
+                walk_relay_json(item, out, depth + 1, in_comment);
             }
         }
         Value::Object(map) => {
             // 1. Identify Story / Post nodes containing `actors` and `message` or `post_id`
-            if let Some(Value::Array(actors)) = map.get("actors") {
-                let is_story_like = map.contains_key("message")
-                    || map.contains_key("post_id")
-                    || map.contains_key("comet_sections");
-                if is_story_like {
-                    for actor in actors {
-                        if let Some(id) = actor.get("id").and_then(Value::as_str) {
-                            push_unique_str(&mut out.author_ids, id);
-                        }
-                        if let Some(name) = actor.get("name").and_then(Value::as_str) {
-                            push_unique_str(&mut out.author_names, name);
-                        }
-                    }
-                    if let Some(msg_text) = map
-                        .get("message")
-                        .and_then(|m| m.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        let norm = normalize_caption(msg_text);
-                        if !norm.is_empty() {
-                            let replace = out
-                                .post_message
-                                .as_ref()
-                                .map(|prev| norm.len() > prev.len())
-                                .unwrap_or(true);
-                            if replace {
-                                out.post_message = Some(norm);
+            if !in_comment {
+                if let Some(Value::Array(actors)) = map.get("actors") {
+                    let is_story_like = map.contains_key("message")
+                        || map.contains_key("post_id")
+                        || map.contains_key("comet_sections");
+                    if is_story_like {
+                        for actor in actors {
+                            if let Some(id) = actor.get("id").and_then(Value::as_str) {
+                                push_unique_str(&mut out.author_ids, id);
+                            }
+                            if let Some(name) = actor.get("name").and_then(Value::as_str) {
+                                push_unique_str(&mut out.author_names, name);
                             }
                         }
+                        if let Some(msg_text) = map
+                            .get("message")
+                            .and_then(|m| m.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            let norm = normalize_caption(msg_text);
+                            if !norm.is_empty() {
+                                let replace = out
+                                    .post_message
+                                    .as_ref()
+                                    .map(|prev| norm.len() > prev.len())
+                                    .unwrap_or(true);
+                                if replace {
+                                    out.post_message = Some(norm);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 1b. Extract multi-photo album attachments (`all_subattachments` / `subattachments`)
+                if let Some(sub) = map.get("all_subattachments").or_else(|| map.get("subattachments")) {
+                    if let Some(count) = sub.get("count").and_then(Value::as_u64) {
+                        let c = count as usize;
+                        if out.expected_album_count.map(|prev| c > prev).unwrap_or(true) {
+                            out.expected_album_count = Some(c);
+                        }
+                    }
+                    if let Some(Value::Array(nodes)) = sub.get("nodes") {
+                        for node in nodes {
+                            if let Some(media) = node.get("media") {
+                                if let Some((pid, uri)) = extract_photo_from_media_obj(media) {
+                                    push_unique_album_photo(out, pid, uri.as_deref());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 1c. Extract single-photo story attachment `styles.attachment.media`
+                if let Some(media) = map.pointer("/styles/attachment/media") {
+                    if let Some((pid, uri)) = extract_photo_from_media_obj(media) {
+                        push_unique_album_photo(out, pid, uri.as_deref());
                     }
                 }
             }
@@ -1199,23 +1296,33 @@ fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize) {
             }
 
             // 3. Recurse through nested objects
+            let child_in_comment = in_comment || is_comment;
             for v in map.values() {
-                walk_relay_json(v, out, depth + 1);
+                walk_relay_json(v, out, depth + 1, child_in_comment);
             }
         }
         _ => {}
     }
 }
 
+struct RelayPostBundle {
+    post_message: Option<String>,
+    discovered_author_id: Option<String>,
+    author_comments: Vec<FacebookAuthorComment>,
+    album_photos: Vec<RelayAlbumPhoto>,
+    expected_album_count: Option<usize>,
+}
+
 /// Parses embedded Relay `<script type="application/json">` blocks in Facebook HTML to extract:
 /// - The clean main post message (without comment chatter)
 /// - Discovered post author ID & display name
 /// - Comments written by the post author themselves (sorted chronologically & deduplicated)
-pub fn extract_relay_post_and_author_comments(
+/// - Album photos attached to the post (excluding commenter avatars)
+fn extract_relay_post_bundle(
     html: &str,
     fallback_author_name: Option<&str>,
     fallback_author_id: Option<&str>,
-) -> (Option<String>, Option<String>, Vec<FacebookAuthorComment>) {
+) -> RelayPostBundle {
     let mut relay = RelayExtractionResult::default();
 
     for cap in SCRIPT_JSON_RE.captures_iter(html) {
@@ -1224,12 +1331,14 @@ pub fn extract_relay_post_and_author_comments(
             if raw_json.is_empty()
                 || (!raw_json.contains("preferred_body")
                     && !raw_json.contains("\"actors\"")
-                    && !raw_json.contains("\"Comment\""))
+                    && !raw_json.contains("\"Comment\"")
+                    && !raw_json.contains("all_subattachments")
+                    && !raw_json.contains("subattachments"))
             {
                 continue;
             }
             if let Ok(parsed) = serde_json::from_str::<Value>(raw_json) {
-                walk_relay_json(&parsed, &mut relay, 0);
+                walk_relay_json(&parsed, &mut relay, 0, false);
             }
         }
     }
@@ -1297,7 +1406,101 @@ pub fn extract_relay_post_and_author_comments(
     author_comments.sort_by_key(|c| c.created_time.unwrap_or(i64::MAX));
 
     let discovered_author_id = relay.author_ids.into_iter().next();
-    (relay.post_message, discovered_author_id, author_comments)
+    RelayPostBundle {
+        post_message: relay.post_message,
+        discovered_author_id,
+        author_comments,
+        album_photos: relay.album_photos,
+        expected_album_count: relay.expected_album_count,
+    }
+}
+
+pub fn extract_relay_post_and_author_comments(
+    html: &str,
+    fallback_author_name: Option<&str>,
+    fallback_author_id: Option<&str>,
+) -> (Option<String>, Option<String>, Vec<FacebookAuthorComment>) {
+    let bundle = extract_relay_post_bundle(html, fallback_author_name, fallback_author_id);
+    (bundle.post_message, bundle.discovered_author_id, bundle.author_comments)
+}
+
+/// Follows Facebook's `nextMediaAfterNodeId` chain via `photo.php?fbid=...&set=pcb.<post_id>`
+/// when a multi-photo post shows `+N` hidden photos beyond the 5 preview nodes in Relay JSON.
+async fn expand_remaining_album_photos(
+    client: &reqwest::Client,
+    html: &str,
+    post_id: &str,
+    album_photos: &mut Vec<RelayAlbumPhoto>,
+    expected_count: Option<usize>,
+) {
+    let Some(target_total) = expected_count else {
+        return;
+    };
+    if target_total <= album_photos.len() || album_photos.is_empty() {
+        return;
+    }
+
+    let set_id = PCB_SET_RE
+        .captures(html)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| format!("pcb.{}", post_id));
+
+    let mut seen_ids: std::collections::HashSet<String> = album_photos
+        .iter()
+        .filter_map(|p| p.id.clone())
+        .collect();
+
+    let mut cur_id = match album_photos.last().and_then(|p| p.id.clone()) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let max_hops = target_total.saturating_sub(album_photos.len()).min(15);
+    for _ in 0..max_hops {
+        let photo_url = format!(
+            "https://www.facebook.com/photo.php?fbid={}&set={}&type=3",
+            cur_id, set_id
+        );
+        let res = match client
+            .get(&photo_url)
+            .header("User-Agent", FB_CRAWLER_USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => break,
+        };
+        let page_html = match res.text().await {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+
+        let next_id = match NEXT_MEDIA_RE
+            .captures(&page_html)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+        {
+            Some(id) => id,
+            None => break,
+        };
+
+        if !seen_ids.insert(next_id.clone()) {
+            // Reached the start of the album loop
+            break;
+        }
+
+        let next_img_url = format!(
+            "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id={}",
+            next_id
+        );
+        album_photos.push(RelayAlbumPhoto {
+            id: Some(next_id.clone()),
+            url: next_img_url,
+        });
+        cur_id = next_id;
+    }
 }
 
 /// Extracts unique lowercase hashtags from text.
@@ -2477,10 +2680,7 @@ pub async fn extract_facebook_post(input: &str) -> Result<FacebookPost, Facebook
         }
     }
 
-    // Step 5: Extract attached images & maximize resolution
-    let images = extract_attached_images_from_html(&html, og.image.as_deref());
-
-    // Step 6: Assemble Author Information & Relay Post / Author Comments
+    // Step 5 & 6: Assemble Author Information, Relay Post / Author Comments & Multi-Photo Album
     let author_name = if let Some(ref title) = og.title {
         parse_author_from_title(title, url_info.author_handle.as_deref())
     } else if let Some(ref handle) = url_info.author_handle {
@@ -2489,12 +2689,36 @@ pub async fn extract_facebook_post(input: &str) -> Result<FacebookPost, Facebook
         "Facebook User".to_string()
     };
 
-    let (relay_post_message, discovered_author_id, author_comments) =
-        extract_relay_post_and_author_comments(
+    let mut relay_bundle = extract_relay_post_bundle(
+        &html,
+        Some(&author_name),
+        url_info.author_handle.as_deref(),
+    );
+
+    if videos.is_empty() && !relay_bundle.album_photos.is_empty() {
+        expand_remaining_album_photos(
+            &client,
             &html,
-            Some(&author_name),
-            url_info.author_handle.as_deref(),
-        );
+            &url_info.id,
+            &mut relay_bundle.album_photos,
+            relay_bundle.expected_album_count,
+        )
+        .await;
+    }
+
+    let mut images = Vec::new();
+    for photo in &relay_bundle.album_photos {
+        if !images.contains(&photo.url) {
+            images.push(photo.url.clone());
+        }
+    }
+    if images.is_empty() {
+        images = extract_attached_images_from_html(&html, og.image.as_deref());
+    }
+
+    let relay_post_message = relay_bundle.post_message;
+    let discovered_author_id = relay_bundle.discovered_author_id;
+    let author_comments = relay_bundle.author_comments;
 
     let author = FacebookAuthor {
         name: author_name,
@@ -3326,5 +3550,39 @@ mod tests {
         assert_eq!(comments[0].text, "1) Link below\nhttps://example.com/resource");
         assert_eq!(comments[1].id.as_deref(), Some("c_2"));
         assert_eq!(comments[1].text, "2) Prompt detail here");
+    }
+
+    #[test]
+    fn test_extract_relay_album_photos_ignores_comment_avatars() {
+        let html = r#"
+            <html><body>
+            <script type="application/json">
+            {
+              "node": {
+                "attachments": [{
+                  "styles": {
+                    "attachment": {
+                      "all_subattachments": {
+                        "count": 3,
+                        "nodes": [
+                          { "media": { "__typename": "Photo", "id": "101", "viewer_image": { "uri": "https:\/\/lookaside.fbsbx.com\/lookaside\/crawler\/media\/?media_id=101" } } },
+                          { "media": { "__typename": "Photo", "id": "102", "image": { "uri": "https:\/\/lookaside.fbsbx.com\/lookaside\/crawler\/media\/?media_id=102" } } },
+                          { "media": { "__typename": "Photo", "id": "103", "viewer_image": { "uri": "https:\/\/lookaside.fbsbx.com\/lookaside\/crawler\/media\/?media_id=103" } } }
+                        ]
+                      }
+                    }
+                  }
+                }]
+              }
+            }
+            </script>
+            </body></html>
+        "#;
+
+        let bundle = extract_relay_post_bundle(html, None, None);
+        assert_eq!(bundle.expected_album_count, Some(3));
+        assert_eq!(bundle.album_photos.len(), 3);
+        assert_eq!(bundle.album_photos[0].id.as_deref(), Some("101"));
+        assert_eq!(bundle.album_photos[2].id.as_deref(), Some("103"));
     }
 }
