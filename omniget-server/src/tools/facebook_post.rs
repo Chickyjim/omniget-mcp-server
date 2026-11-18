@@ -1223,7 +1223,7 @@ fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize, i
                 }
 
                 // 1c. Extract single-photo story attachment `styles.attachment.media`
-                if let Some(media) = map.pointer("/styles/attachment/media") {
+                if let Some(media) = val.pointer("/styles/attachment/media") {
                     if let Some((pid, uri)) = extract_photo_from_media_obj(media) {
                         push_unique_album_photo(out, pid, uri.as_deref());
                     }
