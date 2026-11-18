@@ -168,6 +168,11 @@ static SERVER_RENDERED_DIV_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Valid server rendered div regex")
 });
 
+static SCRIPT_JSON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<script[^>]*type=["']application/json["'][^>]*>(.*?)</script>"#)
+        .expect("Valid script application/json regex")
+});
+
 // ── Data Models ──────────────────────────────────────────────────────────────
 
 /// Arguments payload for `facebook_post` tool invocations.
@@ -231,6 +236,19 @@ pub struct FacebookMediaItem {
     pub has_audio: bool,
 }
 
+/// A comment written by the post author (e.g. continuation 1, 2, 3, 4 or reference links).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacebookAuthorComment {
+    /// Comment identifier, if extracted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Comment text content (including any attached external link URL)
+    pub text: String,
+    /// Creation Unix timestamp (seconds since epoch), if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_time: Option<i64>,
+}
+
 /// Comprehensive extracted metadata for a Facebook post, Reel, or Watch video.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FacebookPost {
@@ -243,6 +261,9 @@ pub struct FacebookPost {
     pub author: FacebookAuthor,
     /// Full post status update / caption text content
     pub caption: String,
+    /// Comments written by the post author (extracted from public HTML Relay payloads)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub author_comments: Vec<FacebookAuthorComment>,
     /// Extracted hashtags without the '#' symbol
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hashtags: Vec<String>,
@@ -995,27 +1016,288 @@ pub fn extract_full_caption_from_html(html: &str) -> Option<String> {
         }
     }
 
-    // 4. Check server-rendered div paragraphs
-    let mut div_paragraphs = Vec::new();
-    for cap in SERVER_RENDERED_DIV_RE.captures_iter(html) {
-        if let Some(m) = cap.get(1) {
-            let stripped = strip_html_tags(m.as_str());
-            let decoded = decode_html_entities(&stripped).trim().to_string();
-            if !decoded.is_empty() {
-                div_paragraphs.push(decoded);
+    // 4. Check server-rendered div paragraphs only if no structured JSON candidate matched
+    // (Prevents mixing comment divs from public HTML into the main post caption)
+    if candidates.is_empty() {
+        let mut div_paragraphs = Vec::new();
+        for cap in SERVER_RENDERED_DIV_RE.captures_iter(html) {
+            if let Some(m) = cap.get(1) {
+                let stripped = strip_html_tags(m.as_str());
+                let decoded = decode_html_entities(&stripped).trim().to_string();
+                if !decoded.is_empty() {
+                    div_paragraphs.push(decoded);
+                }
             }
         }
-    }
-    if !div_paragraphs.is_empty() {
-        let joined = div_paragraphs.join("\n\n");
-        if !joined.trim().is_empty() {
-            candidates.push(joined);
+        if !div_paragraphs.is_empty() {
+            let joined = div_paragraphs.join("\n\n");
+            if !joined.trim().is_empty() {
+                candidates.push(joined);
+            }
         }
     }
 
     // Sort by length descending and return the longest valid candidate
     candidates.sort_by(|a, b| b.len().cmp(&a.len()));
     candidates.into_iter().next()
+}
+
+#[derive(Debug, Default)]
+struct RelayExtractionResult {
+    post_message: Option<String>,
+    author_ids: Vec<String>,
+    author_names: Vec<String>,
+    comments: Vec<RawRelayComment>,
+}
+
+#[derive(Debug, Clone)]
+struct RawRelayComment {
+    id: Option<String>,
+    author_id: Option<String>,
+    author_name: Option<String>,
+    text: String,
+    created_time: Option<i64>,
+}
+
+fn push_unique_str(vec: &mut Vec<String>, val: &str) {
+    let trimmed = val.trim();
+    if !trimmed.is_empty() && !vec.iter().any(|x| x == trimmed) {
+        vec.push(trimmed.to_string());
+    }
+}
+
+fn extract_comment_attachment_urls(attachments: &[Value]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for att in attachments {
+        let candidate = att
+            .pointer("/style_type_renderer/attachment/target/url")
+            .or_else(|| att.pointer("/style_type_renderer/attachment/target/external_url"))
+            .or_else(|| att.pointer("/style_type_renderer/attachment/url"))
+            .or_else(|| att.pointer("/target/url"))
+            .or_else(|| att.pointer("/url"))
+            .and_then(Value::as_str);
+
+        if let Some(raw_url) = candidate {
+            let cleaned = clean_facebook_cdn_url(raw_url);
+            if cleaned.starts_with("http") && !urls.contains(&cleaned) {
+                urls.push(cleaned);
+            }
+        }
+    }
+    urls
+}
+
+fn walk_relay_json(val: &Value, out: &mut RelayExtractionResult, depth: usize) {
+    if depth > 60 {
+        return;
+    }
+
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                walk_relay_json(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            // 1. Identify Story / Post nodes containing `actors` and `message` or `post_id`
+            if let Some(Value::Array(actors)) = map.get("actors") {
+                let is_story_like = map.contains_key("message")
+                    || map.contains_key("post_id")
+                    || map.contains_key("comet_sections");
+                if is_story_like {
+                    for actor in actors {
+                        if let Some(id) = actor.get("id").and_then(Value::as_str) {
+                            push_unique_str(&mut out.author_ids, id);
+                        }
+                        if let Some(name) = actor.get("name").and_then(Value::as_str) {
+                            push_unique_str(&mut out.author_names, name);
+                        }
+                    }
+                    if let Some(msg_text) = map
+                        .get("message")
+                        .and_then(|m| m.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        let norm = normalize_caption(msg_text);
+                        if !norm.is_empty() {
+                            let replace = out
+                                .post_message
+                                .as_ref()
+                                .map(|prev| norm.len() > prev.len())
+                                .unwrap_or(true);
+                            if replace {
+                                out.post_message = Some(norm);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Identify Comment nodes with author & text/attachments
+            let is_comment = map.get("__typename").and_then(Value::as_str) == Some("Comment")
+                || (map.contains_key("preferred_body") && map.contains_key("author"))
+                || (map.contains_key("legacy_fbid")
+                    && map.contains_key("author")
+                    && map.contains_key("body"));
+
+            if is_comment {
+                if let Some(Value::Object(author_obj)) = map.get("author") {
+                    let author_id = author_obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let author_name = author_obj
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    let body_text = map
+                        .get("preferred_body")
+                        .and_then(|b| b.get("text"))
+                        .and_then(Value::as_str)
+                        .or_else(|| map.get("body").and_then(|b| b.get("text")).and_then(Value::as_str))
+                        .unwrap_or("");
+
+                    let mut text_parts = Vec::new();
+                    let norm_body = normalize_caption(body_text);
+                    if !norm_body.is_empty() {
+                        text_parts.push(norm_body);
+                    }
+
+                    if let Some(Value::Array(atts)) = map.get("attachments") {
+                        for att_url in extract_comment_attachment_urls(atts) {
+                            let already_present = text_parts
+                                .iter()
+                                .any(|part| part.contains(&att_url));
+                            if !already_present {
+                                text_parts.push(att_url);
+                            }
+                        }
+                    }
+
+                    let combined_text = text_parts.join("\n");
+                    if !combined_text.is_empty() && (author_id.is_some() || author_name.is_some()) {
+                        let id = map
+                            .get("legacy_fbid")
+                            .or_else(|| map.get("id"))
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let created_time = map.get("created_time").and_then(Value::as_i64);
+
+                        out.comments.push(RawRelayComment {
+                            id,
+                            author_id,
+                            author_name,
+                            text: combined_text,
+                            created_time,
+                        });
+                    }
+                }
+            }
+
+            // 3. Recurse through nested objects
+            for v in map.values() {
+                walk_relay_json(v, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses embedded Relay `<script type="application/json">` blocks in Facebook HTML to extract:
+/// - The clean main post message (without comment chatter)
+/// - Discovered post author ID & display name
+/// - Comments written by the post author themselves (sorted chronologically & deduplicated)
+pub fn extract_relay_post_and_author_comments(
+    html: &str,
+    fallback_author_name: Option<&str>,
+    fallback_author_id: Option<&str>,
+) -> (Option<String>, Option<String>, Vec<FacebookAuthorComment>) {
+    let mut relay = RelayExtractionResult::default();
+
+    for cap in SCRIPT_JSON_RE.captures_iter(html) {
+        if let Some(json_match) = cap.get(1) {
+            let raw_json = json_match.as_str().trim();
+            if raw_json.is_empty()
+                || (!raw_json.contains("preferred_body")
+                    && !raw_json.contains("\"actors\"")
+                    && !raw_json.contains("\"Comment\""))
+            {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(raw_json) {
+                walk_relay_json(&parsed, &mut relay, 0);
+            }
+        }
+    }
+
+    if let Some(fb_id) = fallback_author_id {
+        if fb_id.chars().all(|c| c.is_ascii_digit()) {
+            push_unique_str(&mut relay.author_ids, fb_id);
+        }
+    }
+    if let Some(fb_name) = fallback_author_name {
+        let trimmed = fb_name.trim();
+        if !trimmed.is_empty() && trimmed != "Facebook User" {
+            push_unique_str(&mut relay.author_names, trimmed);
+        }
+    }
+
+    let author_names_lower: Vec<String> = relay
+        .author_names
+        .iter()
+        .map(|n| n.to_lowercase())
+        .collect();
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_texts = std::collections::HashSet::new();
+    let mut author_comments = Vec::new();
+
+    for c in relay.comments {
+        let matches_author = if !relay.author_ids.is_empty() {
+            match &c.author_id {
+                Some(cid) => relay.author_ids.iter().any(|aid| aid == cid),
+                None => c
+                    .author_name
+                    .as_ref()
+                    .map(|n| author_names_lower.contains(&n.to_lowercase()))
+                    .unwrap_or(false),
+            }
+        } else {
+            c.author_name
+                .as_ref()
+                .map(|n| author_names_lower.contains(&n.to_lowercase()))
+                .unwrap_or(false)
+        };
+
+        if !matches_author {
+            continue;
+        }
+
+        if let Some(ref cid) = c.id {
+            if !seen_ids.insert(cid.clone()) {
+                continue;
+            }
+        }
+        if !seen_texts.insert(c.text.clone()) {
+            continue;
+        }
+
+        author_comments.push(FacebookAuthorComment {
+            id: c.id,
+            text: c.text,
+            created_time: c.created_time,
+        });
+    }
+
+    // Sort chronologically (1, 2, 3, 4...)
+    author_comments.sort_by_key(|c| c.created_time.unwrap_or(i64::MAX));
+
+    let discovered_author_id = relay.author_ids.into_iter().next();
+    (relay.post_message, discovered_author_id, author_comments)
 }
 
 /// Extracts unique lowercase hashtags from text.
@@ -1815,6 +2097,7 @@ pub async fn fetch_via_ytdlp(
         url: canonical_url.to_string(),
         author,
         caption,
+        author_comments: Vec::new(),
         hashtags,
         images,
         videos,
@@ -1897,6 +2180,14 @@ pub fn generate_markdown_summary(post: &FacebookPost) -> String {
     } else {
         md.push_str(&post.caption);
         md.push_str("\n\n");
+    }
+
+    // Author Comments (e.g. links or continuation 1, 2, 3, 4 by post owner)
+    if !post.author_comments.is_empty() {
+        md.push_str("### Author Comments\n\n");
+        for (idx, comment) in post.author_comments.iter().enumerate() {
+            md.push_str(&format!("{}. {}\n\n", idx + 1, comment.text));
+        }
     }
 
     // Hashtags if extracted
@@ -2189,7 +2480,7 @@ pub async fn extract_facebook_post(input: &str) -> Result<FacebookPost, Facebook
     // Step 5: Extract attached images & maximize resolution
     let images = extract_attached_images_from_html(&html, og.image.as_deref());
 
-    // Step 6: Assemble Author Information
+    // Step 6: Assemble Author Information & Relay Post / Author Comments
     let author_name = if let Some(ref title) = og.title {
         parse_author_from_title(title, url_info.author_handle.as_deref())
     } else if let Some(ref handle) = url_info.author_handle {
@@ -2198,30 +2489,51 @@ pub async fn extract_facebook_post(input: &str) -> Result<FacebookPost, Facebook
         "Facebook User".to_string()
     };
 
+    let (relay_post_message, discovered_author_id, author_comments) =
+        extract_relay_post_and_author_comments(
+            &html,
+            Some(&author_name),
+            url_info.author_handle.as_deref(),
+        );
+
     let author = FacebookAuthor {
         name: author_name,
         url: url_info
             .author_handle
             .as_ref()
-            .map(|h| format!("https://www.facebook.com/{}/", h)),
-        id: url_info.author_handle.clone(),
+            .map(|h| format!("https://www.facebook.com/{}/", h))
+            .or_else(|| {
+                discovered_author_id
+                    .as_ref()
+                    .map(|id| format!("https://www.facebook.com/{}/", id))
+            }),
+        id: url_info.author_handle.clone().or(discovered_author_id),
         avatar_url: None,
         is_verified: None,
     };
 
-    let full_caption_opt = extract_full_caption_from_html(&html);
-    let caption = if let Some(full) = full_caption_opt {
+    let og_desc = og.description.as_deref().map(normalize_caption).unwrap_or_default();
+    let caption = if let Some(relay_msg) = relay_post_message {
+        if relay_msg.len() >= og_desc.len() || og_desc.ends_with("...") || og_desc.is_empty() {
+            relay_msg
+        } else {
+            og_desc
+        }
+    } else if let Some(full) = extract_full_caption_from_html(&html) {
         let norm_full = normalize_caption(&full);
-        let og_desc = og.description.as_deref().map(normalize_caption).unwrap_or_default();
         if norm_full.len() > og_desc.len() || og_desc.ends_with("...") {
             norm_full
         } else {
             og_desc
         }
     } else {
-        og.description.as_deref().map(normalize_caption).unwrap_or_default()
+        og_desc
     };
-    let hashtags = extract_hashtags(&caption);
+    let mut hashtag_sources = vec![caption.clone()];
+    for c in &author_comments {
+        hashtag_sources.push(c.text.clone());
+    }
+    let hashtags = extract_hashtags(&hashtag_sources.join("\n"));
     let is_video = !videos.is_empty() || url_info.is_video;
     let has_audio = audio_url.is_some() || is_video;
     let media_type = if is_video {
@@ -2271,6 +2583,7 @@ pub async fn extract_facebook_post(input: &str) -> Result<FacebookPost, Facebook
         url: og.url.unwrap_or(url_info.canonical_url),
         author,
         caption,
+        author_comments,
         hashtags,
         images,
         videos,
@@ -2849,6 +3162,7 @@ mod tests {
                 is_verified: Some(true),
             },
             caption: "How to share with just friends.".into(),
+            author_comments: Vec::new(),
             hashtags: vec!["privacy".into(), "facebook".into()],
             images: vec!["https://lookaside.fbsbx.com/preview.jpg".into()],
             videos: vec!["https://video.xx.fbcdn.net/stream_hd.mp4".into()],
@@ -2951,5 +3265,66 @@ mod tests {
         let res = call_facebook_post(json!({ "url": "https://notfacebook.com/posts/123" })).await.unwrap();
         assert_eq!(res["isError"], true);
         assert!(res["content"][0]["text"].as_str().unwrap().contains("Invalid domain"));
+    }
+
+    #[test]
+    fn test_extract_relay_post_and_author_comments_filters_and_sorts() {
+        let html = r#"
+            <html><body>
+            <script type="application/json">
+            {
+              "story": {
+                "actors": [{ "id": "61552589638108", "name": "AI Page" }],
+                "message": { "text": "Main post caption #AI" }
+              },
+              "comments": [
+                {
+                  "__typename": "Comment",
+                  "legacy_fbid": "c_2",
+                  "created_time": 200,
+                  "author": { "id": "61552589638108", "name": "AI Page" },
+                  "preferred_body": { "text": "2) Prompt detail here" },
+                  "attachments": []
+                },
+                {
+                  "__typename": "Comment",
+                  "legacy_fbid": "c_other",
+                  "created_time": 150,
+                  "author": { "id": "999999", "name": "Random Commenter" },
+                  "preferred_body": { "text": "Thanks for sharing!" },
+                  "attachments": []
+                },
+                {
+                  "__typename": "Comment",
+                  "legacy_fbid": "c_1",
+                  "created_time": 100,
+                  "author": { "id": "61552589638108", "name": "AI Page" },
+                  "preferred_body": { "text": "1) Link below" },
+                  "attachments": [
+                    {
+                      "style_type_renderer": {
+                        "attachment": {
+                          "target": { "url": "https://example.com/resource" }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+            </script>
+            </body></html>
+        "#;
+
+        let (post_msg, author_id, comments) =
+            extract_relay_post_and_author_comments(html, Some("AI Page"), None);
+
+        assert_eq!(post_msg.as_deref(), Some("Main post caption #AI"));
+        assert_eq!(author_id.as_deref(), Some("61552589638108"));
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id.as_deref(), Some("c_1"));
+        assert_eq!(comments[0].text, "1) Link below\nhttps://example.com/resource");
+        assert_eq!(comments[1].id.as_deref(), Some("c_2"));
+        assert_eq!(comments[1].text, "2) Prompt detail here");
     }
 }
